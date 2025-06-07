@@ -14,7 +14,7 @@ from PIL import Image
 import os
 
 # Import HMAD framework
-from hmad import HMADFramework, create_hmad_model, HMADTrainer
+from hmad_original import HMADFramework, create_hmad_model
 
 def load_mindbigdata_sample(filepath: str, max_samples: int = 10):
     """Load sample data dari MindBigData EPOC untuk testing"""
@@ -314,13 +314,13 @@ def test_hmad_framework():
     print("\nLoading datasets...")
     
     # MindBigData
-    mindbig_eeg, mindbig_labels = load_mindbigdata_sample("datasets/EP1.01.txt", max_samples=5)
-    
+    mindbig_eeg, mindbig_labels = load_mindbigdata_sample("../datasets/EP1.01.txt", max_samples=5)
+
     # Crell
-    crell_eeg, crell_labels = load_crell_sample("datasets/S01.mat", max_samples=5)
-    
+    crell_eeg, crell_labels = load_crell_sample("../datasets/S01.mat", max_samples=5)
+
     # Stimulus images
-    stimulus_images = load_stimulus_images("datasets", image_size=config['image_size'])
+    stimulus_images = load_stimulus_images("../datasets", image_size=config['image_size'])
     
     # Test forward pass
     print("\nTesting forward pass...")

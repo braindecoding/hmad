@@ -9,6 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import math
+import matplotlib.pyplot as plt
 from typing import Optional
 from test_hmad import load_mindbigdata_sample, load_crell_sample, load_stimulus_images
 
@@ -982,6 +983,165 @@ class TwoStageDiffusionGenerator(nn.Module):
 
         return total_loss
 
+def visualize_reconstruction_results(target_images, reconstructed_images, dataset_name, save_path=None):
+    """
+    Visualize comparison between target and reconstructed images
+
+    Args:
+        target_images: (batch_size, 3, H, W) - Target images
+        reconstructed_images: (batch_size, 3, H, W) - Reconstructed images
+        dataset_name: str - Name of dataset
+        save_path: str - Path to save visualization
+    """
+    batch_size = target_images.shape[0]
+
+    # Convert tensors to numpy and denormalize
+    target_np = target_images.detach().cpu().numpy()
+    recon_np = reconstructed_images.detach().cpu().numpy()
+
+    # Denormalize from [-1, 1] to [0, 1]
+    target_np = (target_np + 1) / 2
+    recon_np = (recon_np + 1) / 2
+
+    # Clip values to [0, 1]
+    target_np = np.clip(target_np, 0, 1)
+    recon_np = np.clip(recon_np, 0, 1)
+
+    # Create figure
+    fig, axes = plt.subplots(2, batch_size, figsize=(batch_size * 3, 6))
+    if batch_size == 1:
+        axes = axes.reshape(2, 1)
+
+    fig.suptitle(f'HMAD Reconstruction Results - {dataset_name}', fontsize=16, fontweight='bold')
+
+    for i in range(batch_size):
+        # Target images (top row)
+        target_img = np.transpose(target_np[i], (1, 2, 0))
+        axes[0, i].imshow(target_img)
+        axes[0, i].set_title(f'Target {i+1}', fontweight='bold')
+        axes[0, i].axis('off')
+
+        # Reconstructed images (bottom row)
+        recon_img = np.transpose(recon_np[i], (1, 2, 0))
+        axes[1, i].imshow(recon_img)
+        axes[1, i].set_title(f'Reconstructed {i+1}', fontweight='bold')
+        axes[1, i].axis('off')
+
+    # Add row labels
+    axes[0, 0].text(-0.1, 0.5, 'Target\nImages', transform=axes[0, 0].transAxes,
+                    fontsize=14, fontweight='bold', ha='center', va='center', rotation=90)
+    axes[1, 0].text(-0.1, 0.5, 'HMAD\nReconstruction', transform=axes[1, 0].transAxes,
+                    fontsize=14, fontweight='bold', ha='center', va='center', rotation=90)
+
+    plt.tight_layout()
+
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"  Visualization saved to: {save_path}")
+
+    plt.show()
+
+    # Calculate and display metrics
+    mse = F.mse_loss(reconstructed_images, target_images).item()
+    mae = F.l1_loss(reconstructed_images, target_images).item()
+
+    print(f"  Reconstruction Metrics for {dataset_name}:")
+    print(f"    MSE: {mse:.4f}")
+    print(f"    MAE: {mae:.4f}")
+
+    return mse, mae
+
+def create_synthetic_target_images(batch_size, image_size=64, dataset_type='mindbigdata'):
+    """
+    Create synthetic target images for visualization
+
+    Args:
+        batch_size: Number of images to create
+        image_size: Size of images
+        dataset_type: Type of dataset ('mindbigdata' or 'crell')
+    """
+    if dataset_type == 'mindbigdata':
+        # Create digit-like patterns for MindBigData
+        targets = []
+        for i in range(batch_size):
+            # Create a simple digit pattern
+            img = torch.zeros(3, image_size, image_size)
+
+            # Create different patterns for each sample
+            if i % 3 == 0:  # Digit "0" pattern
+                center_x, center_y = image_size // 2, image_size // 2
+                radius = image_size // 4
+                y, x = torch.meshgrid(torch.arange(image_size), torch.arange(image_size), indexing='ij')
+                circle_mask = ((x - center_x) ** 2 + (y - center_y) ** 2) < radius ** 2
+                ring_mask = ((x - center_x) ** 2 + (y - center_y) ** 2) > (radius - 5) ** 2
+                final_mask = circle_mask & ring_mask
+                img[:, final_mask] = 0.8
+
+            elif i % 3 == 1:  # Digit "1" pattern
+                center_x = image_size // 2
+                img[:, :, center_x-2:center_x+3] = 0.8
+
+            else:  # Digit "8" pattern
+                # Top circle
+                center_x, center_y = image_size // 2, image_size // 3
+                radius = image_size // 6
+                y, x = torch.meshgrid(torch.arange(image_size), torch.arange(image_size), indexing='ij')
+                circle_mask1 = ((x - center_x) ** 2 + (y - center_y) ** 2) < radius ** 2
+                ring_mask1 = ((x - center_x) ** 2 + (y - center_y) ** 2) > (radius - 3) ** 2
+                img[:, circle_mask1 & ring_mask1] = 0.8
+
+                # Bottom circle
+                center_y = 2 * image_size // 3
+                circle_mask2 = ((x - center_x) ** 2 + (y - center_y) ** 2) < radius ** 2
+                ring_mask2 = ((x - center_x) ** 2 + (y - center_y) ** 2) > (radius - 3) ** 2
+                img[:, circle_mask2 & ring_mask2] = 0.8
+
+            targets.append(img)
+
+    else:  # crell dataset
+        # Create letter-like patterns for Crell
+        targets = []
+        for i in range(batch_size):
+            img = torch.zeros(3, image_size, image_size)
+
+            if i % 3 == 0:  # Letter "A" pattern
+                # Vertical lines
+                img[:, 10:50, 15:20] = 0.8
+                img[:, 10:50, 45:50] = 0.8
+                # Horizontal line
+                img[:, 25:30, 15:50] = 0.8
+                # Top connection
+                img[:, 10:15, 20:45] = 0.8
+
+            elif i % 3 == 1:  # Letter "B" pattern
+                # Vertical line
+                img[:, 10:50, 15:20] = 0.8
+                # Top horizontal
+                img[:, 10:15, 15:40] = 0.8
+                # Middle horizontal
+                img[:, 27:32, 15:35] = 0.8
+                # Bottom horizontal
+                img[:, 45:50, 15:40] = 0.8
+                # Right curves (simplified)
+                img[:, 15:27, 35:40] = 0.8
+                img[:, 32:45, 35:40] = 0.8
+
+            else:  # Letter "C" pattern
+                # Left vertical
+                img[:, 15:45, 15:20] = 0.8
+                # Top horizontal
+                img[:, 15:20, 15:45] = 0.8
+                # Bottom horizontal
+                img[:, 40:45, 15:45] = 0.8
+
+            targets.append(img)
+
+    # Stack and normalize to [-1, 1] range
+    target_tensor = torch.stack(targets)
+    target_tensor = target_tensor * 2 - 1  # Convert [0, 1] to [-1, 1]
+
+    return target_tensor
+
 class GradientReversalLayer(torch.autograd.Function):
     """Gradient Reversal Layer untuk adversarial training"""
 
@@ -1039,6 +1199,65 @@ class DomainAdaptationModule(nn.Module):
             'adapted_features': normalized_features,
             'domain_predictions': domain_pred
         }
+
+def visualize_reconstruction_results(reconstructed_images, dataset_name, eeg_labels=None, save_path=None):
+    """
+    Visualize HMAD reconstruction results from real EEG data
+
+    Args:
+        reconstructed_images: (batch_size, 3, H, W) - Images reconstructed from real EEG
+        dataset_name: str - Name of dataset
+        eeg_labels: Labels corresponding to EEG data (if available)
+        save_path: str - Path to save visualization
+    """
+    batch_size = reconstructed_images.shape[0]
+
+    # Convert tensors to numpy and denormalize
+    recon_np = reconstructed_images.detach().cpu().numpy()
+
+    # Denormalize from [-1, 1] to [0, 1]
+    recon_np = (recon_np + 1) / 2
+
+    # Clip values to [0, 1]
+    recon_np = np.clip(recon_np, 0, 1)
+
+    # Create figure
+    fig, axes = plt.subplots(1, batch_size, figsize=(batch_size * 3, 3))
+    if batch_size == 1:
+        axes = [axes]
+
+    fig.suptitle(f'HMAD EEG-to-Image Reconstruction - {dataset_name}', fontsize=16, fontweight='bold')
+
+    for i in range(batch_size):
+        # Reconstructed images
+        recon_img = np.transpose(recon_np[i], (1, 2, 0))
+        axes[i].imshow(recon_img)
+
+        # Add label if available
+        if eeg_labels is not None:
+            if dataset_name.lower() == 'mindbigdata':
+                title = f'Digit: {eeg_labels[i]}'
+            else:  # crell
+                title = f'Letter: {chr(65 + eeg_labels[i])}'  # Convert to A-Z
+        else:
+            title = f'Sample {i+1}'
+
+        axes[i].set_title(title, fontweight='bold')
+        axes[i].axis('off')
+
+    plt.tight_layout()
+
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"  Visualization saved to: {save_path}")
+
+    plt.show()
+
+    # Display reconstruction info
+    print(f"  Reconstruction Info for {dataset_name}:")
+    print(f"    Generated {batch_size} images from real EEG signals")
+    print(f"    Image shape: {reconstructed_images.shape}")
+    print(f"    Value range: [{recon_np.min():.3f}, {recon_np.max():.3f}]")
 
 def test_enhanced_hmad():
     """Test enhanced HMAD framework dengan domain adaptation"""
@@ -1230,6 +1449,31 @@ def test_enhanced_hmad():
     print("\n" + "="*60)
     print("ENHANCED HMAD FRAMEWORK PHASE 5 TEST COMPLETED")
     print("="*60)
+
+    # Visualize reconstruction results
+    print("\nGenerating visualizations...")
+
+    # Test with MindBigData
+    print("\nVisualizing MindBigData reconstructions...")
+    with torch.no_grad():
+        mindbig_outputs = model(mindbig_eeg, 'mindbigdata', target_images)
+        visualize_reconstruction_results(
+            mindbig_outputs['generated_images'],
+            'MindBigData',
+            mindbig_labels,
+            save_path='hmad_mindbigdata_reconstruction.png'
+        )
+
+    # Test with Crell
+    print("\nVisualizing Crell reconstructions...")
+    with torch.no_grad():
+        crell_outputs = model(crell_eeg, 'crell', target_images)
+        visualize_reconstruction_results(
+            crell_outputs['generated_images'],
+            'Crell',
+            crell_labels,
+            save_path='hmad_crell_reconstruction.png'
+        )
     
     # Test training step
     print("\nTesting training step...")
