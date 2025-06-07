@@ -32,109 +32,77 @@ class HilbertHuangTransform(nn.Module):
         self.use_simple_decomposition = True  # Use simple filtering instead of EMD
         
     def empirical_mode_decomposition(self, signal: torch.Tensor) -> torch.Tensor:
-        """Simplified EMD using filtering approach untuk stability"""
+        """EMD dengan stopping criteria optimized untuk EEG"""
         batch_size, channels, time_points = signal.shape
-
-        # Use simplified filtering-based approach instead of complex EMD
-        if self.use_simple_decomposition:
-            return self.simple_mode_decomposition(signal)
-
-        # Original EMD implementation (kept for reference but not used)
-        imfs_list = []
-
+        imfs = []
+        
         for b in range(batch_size):
             batch_imfs = []
             for c in range(channels):
                 s = signal[b, c].cpu().numpy()
-                channel_imfs = []
-
-                # Create IMFs using simple filtering approach
                 residue = s.copy()
-
-                for imf_idx in range(self.num_imfs):
-                    # Simple high-pass filtering for each IMF
-                    # Higher frequency components first
-                    cutoff_freq = 0.5 / (2 ** imf_idx)  # Decreasing frequency
-
-                    # Simple moving average filter (low-pass)
-                    window_size = max(3, int(len(s) * cutoff_freq))
-                    if window_size >= len(s):
-                        window_size = len(s) // 4
-
-                    # Apply simple smoothing
-                    if window_size > 1:
-                        kernel = np.ones(window_size) / window_size
-                        # Pad signal for convolution
-                        padded_signal = np.pad(residue, (window_size//2, window_size//2), mode='edge')
-                        smoothed = np.convolve(padded_signal, kernel, mode='valid')
-
-                        # Ensure same length
-                        if len(smoothed) != len(residue):
-                            smoothed = smoothed[:len(residue)]
-
-                        # IMF is the difference (high-frequency component)
-                        imf = residue - smoothed
-                        channel_imfs.append(imf)
-                        residue = smoothed
-                    else:
-                        # If window too small, just use residue
-                        channel_imfs.append(residue.copy())
-                        residue = np.zeros_like(residue)
-
-                # Pad to ensure we have exactly num_imfs
-                while len(channel_imfs) < self.num_imfs:
-                    channel_imfs.append(np.zeros_like(s))
-
-                batch_imfs.append(np.stack(channel_imfs[:self.num_imfs]))
-
-            imfs_list.append(np.stack(batch_imfs))
-
-        return torch.tensor(np.stack(imfs_list), dtype=signal.dtype, device=signal.device)
-
-    def simple_mode_decomposition(self, signal: torch.Tensor) -> torch.Tensor:
-        """Simple filtering-based mode decomposition"""
-        batch_size, channels, time_points = signal.shape
-
-        # Create different frequency band filters as IMFs
-        imfs_list = []
-
-        for b in range(batch_size):
-            batch_imfs = []
-            for c in range(channels):
-                s = signal[b, c].cpu().numpy()
                 channel_imfs = []
-
-                # Create frequency bands using simple filtering
-                for imf_idx in range(self.num_imfs):
-                    # Different frequency bands
-                    if imf_idx == 0:
-                        # High frequency (original signal)
-                        imf = s.copy()
-                    else:
-                        # Apply simple smoothing with increasing window size
-                        window_size = min(2 ** (imf_idx + 1), len(s) // 4)
-                        if window_size > 1:
-                            kernel = np.ones(window_size) / window_size
-                            padded = np.pad(s, (window_size//2, window_size//2), mode='edge')
-                            smoothed = np.convolve(padded, kernel, mode='valid')
-
-                            # Ensure correct length
-                            if len(smoothed) > len(s):
-                                smoothed = smoothed[:len(s)]
-                            elif len(smoothed) < len(s):
-                                smoothed = np.pad(smoothed, (0, len(s) - len(smoothed)), mode='edge')
-
-                            imf = s - smoothed
+                
+                for _ in range(self.num_imfs):
+                    # Sifting process
+                    h = residue.copy()
+                    for _ in range(10):  # Max 10 sifting iterations
+                        # Find local maxima and minima
+                        maxima_idx = []
+                        minima_idx = []
+                        
+                        for i in range(1, len(h)-1):
+                            if h[i] > h[i-1] and h[i] > h[i+1]:
+                                maxima_idx.append(i)
+                            elif h[i] < h[i-1] and h[i] < h[i+1]:
+                                minima_idx.append(i)
+                        
+                        if len(maxima_idx) < 2 or len(minima_idx) < 2:
+                            break
+                            
+                        # Cubic spline interpolation for envelopes
+                        from scipy.interpolate import interp1d
+                        
+                        # Upper envelope
+                        if len(maxima_idx) >= 2:
+                            max_env = interp1d(maxima_idx, h[maxima_idx], 
+                                             kind='cubic', fill_value='extrapolate')
+                            upper = max_env(range(len(h)))
                         else:
-                            imf = np.zeros_like(s)
-
-                    channel_imfs.append(imf)
-
+                            upper = np.zeros_like(h)
+                        
+                        # Lower envelope
+                        if len(minima_idx) >= 2:
+                            min_env = interp1d(minima_idx, h[minima_idx], 
+                                             kind='cubic', fill_value='extrapolate')
+                            lower = min_env(range(len(h)))
+                        else:
+                            lower = np.zeros_like(h)
+                        
+                        # Mean of envelopes
+                        mean_env = (upper + lower) / 2
+                        
+                        # Update h
+                        prev_h = h.copy()
+                        h = h - mean_env
+                        
+                        # Stopping criterion
+                        sd = np.sum((prev_h - h)**2) / np.sum(prev_h**2)
+                        if sd < 0.2:  # Standard stopping criterion
+                            break
+                    
+                    channel_imfs.append(h)
+                    residue = residue - h
+                    
+                    # Stop if residue is monotonic
+                    if len(np.where(np.diff(np.sign(np.diff(residue))))[0]) < 2:
+                        break
+                
                 batch_imfs.append(np.stack(channel_imfs))
-
-            imfs_list.append(np.stack(batch_imfs))
-
-        return torch.tensor(np.stack(imfs_list), dtype=signal.dtype, device=signal.device)
+            
+            imfs.append(np.stack(batch_imfs))
+        
+        return torch.tensor(np.stack(imfs), dtype=signal.dtype, device=signal.device)
     
     def instantaneous_frequency(self, imfs: torch.Tensor) -> torch.Tensor:
         """Calculate instantaneous frequency menggunakan Hilbert transform"""
@@ -149,7 +117,7 @@ class HilbertHuangTransform(nn.Module):
                     instantaneous_phase = np.unwrap(np.angle(analytic_signal))
                     freq = np.diff(instantaneous_phase) / (2.0 * np.pi)
                     freq = np.concatenate([freq, [freq[-1]]])  # Pad to original length
-                    inst_freq[b, c, imf_idx] = torch.tensor(freq, dtype=imfs.dtype, device=imfs.device)
+                    inst_freq[b, c, imf_idx] = torch.tensor(freq, device=imfs.device)
         
         return inst_freq
     
@@ -211,9 +179,9 @@ class GraphConnectivityAnalyzer(nn.Module):
                     # Phase synchronization
                     phase_diff = phase_i - phase_j
                     psi = np.abs(np.mean(np.exp(1j * phase_diff)))
-
-                    connectivity[b, i, j] = torch.tensor(psi, dtype=connectivity.dtype, device=connectivity.device)
-                    connectivity[b, j, i] = torch.tensor(psi, dtype=connectivity.dtype, device=connectivity.device)  # Symmetric
+                    
+                    connectivity[b, i, j] = psi
+                    connectivity[b, j, i] = psi  # Symmetric
         
         return connectivity
     
@@ -297,15 +265,7 @@ class TimeFrequencyMultiHeadCrossAttention(nn.Module):
         batch_size, channels, time_points = x.shape
         
         # Time domain features (original signal)
-        x_transposed = x.transpose(1, 2)  # (batch, time, channels)
-        # Ensure correct dimension for projection
-        if x_transposed.shape[-1] != self.d_model:
-            # Add a linear layer to match dimensions
-            if not hasattr(self, 'input_projection'):
-                self.input_projection = nn.Linear(x_transposed.shape[-1], self.d_model).to(x.device)
-            time_features = self.input_projection(x_transposed)
-        else:
-            time_features = self.time_projection(x_transposed)
+        time_features = self.time_projection(x.transpose(1, 2))  # (batch, time, channels)
         
         # Frequency domain features menggunakan STFT
         stft = torch.stft(
