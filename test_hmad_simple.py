@@ -297,7 +297,7 @@ class CrossModalAlignmentModule(nn.Module):
         return (loss_eeg_to_image + loss_image_to_eeg) / 2
 
 class EnhancedHMAD(nn.Module):
-    """Enhanced HMAD dengan two-stage diffusion generation - Phase 4"""
+    """Enhanced HMAD dengan domain adaptation - Phase 5"""
 
     def __init__(self,
                  mindbigdata_channels: int = 14,
@@ -308,13 +308,15 @@ class EnhancedHMAD(nn.Module):
                  use_advanced_preprocessing: bool = True,
                  use_multi_branch: bool = True,
                  use_cross_modal_alignment: bool = True,
-                 use_two_stage_diffusion: bool = True):
+                 use_two_stage_diffusion: bool = True,
+                 use_domain_adaptation: bool = True):
         super().__init__()
 
         self.use_advanced_preprocessing = use_advanced_preprocessing
         self.use_multi_branch = use_multi_branch
         self.use_cross_modal_alignment = use_cross_modal_alignment
         self.use_two_stage_diffusion = use_two_stage_diffusion
+        self.use_domain_adaptation = use_domain_adaptation
         self.d_model = d_model
         self.clip_dim = clip_dim
 
@@ -382,16 +384,30 @@ class EnhancedHMAD(nn.Module):
                 nn.LayerNorm(clip_dim)
             )
 
+        # Domain adaptation (Phase 5)
+        if use_domain_adaptation:
+            self.domain_adapter = DomainAdaptationModule(clip_dim, num_domains=2)
+
         # Two-stage diffusion generator (Phase 4)
         if use_two_stage_diffusion:
             self.image_generator = TwoStageDiffusionGenerator(clip_dim, clip_dim, image_size)  # Use clip_dim for both
         else:
             # Enhanced image generator (fallback)
             self.image_generator = EnhancedImageGenerator(clip_dim, image_size)
+
+        # Loss weights for domain adaptation
+        if use_domain_adaptation:
+            self.domain_loss_weight = nn.Parameter(torch.tensor(0.1))
         
     def forward(self, eeg_data, dataset_type, target_images=None):
-        """Enhanced forward pass dengan multi-branch feature extraction"""
+        """Enhanced forward pass dengan domain adaptation"""
         batch_size = eeg_data.shape[0]
+
+        # Create domain ID
+        if dataset_type == 'mindbigdata':
+            domain_id = torch.zeros(batch_size, dtype=torch.long, device=eeg_data.device)
+        else:  # crell
+            domain_id = torch.ones(batch_size, dtype=torch.long, device=eeg_data.device)
 
         # Advanced preprocessing (Phase 1)
         advanced_features = {}
@@ -576,13 +592,42 @@ class EnhancedHMAD(nn.Module):
             # Basic alignment
             aligned_features = self.alignment_module(pooled_features)
 
+        # Domain adaptation (Phase 5)
+        domain_features = {}
+
+        if self.use_domain_adaptation:
+            try:
+                # Domain adaptation
+                adaptation_outputs = self.domain_adapter(aligned_features, domain_id)
+                adapted_features = adaptation_outputs['adapted_features']
+                domain_predictions = adaptation_outputs['domain_predictions']
+
+                domain_features = {
+                    'adapted_features': adapted_features,
+                    'domain_predictions': domain_predictions,
+                    'domain_loss': F.cross_entropy(domain_predictions, domain_id)
+                }
+
+                print(f"  Domain adaptation successful for {dataset_type}")
+
+                # Use adapted features for image generation
+                final_features = adapted_features
+
+            except Exception as e:
+                print(f"  Domain adaptation failed: {e}, falling back to aligned features")
+                self.use_domain_adaptation = False
+                final_features = aligned_features
+        else:
+            # Use aligned features directly
+            final_features = aligned_features
+
         # Image generation (Phase 4)
         diffusion_features = {}
 
         if self.use_two_stage_diffusion:
             try:
-                # Two-stage diffusion generation (use aligned_features instead of pooled_features)
-                diffusion_outputs = self.image_generator(aligned_features, target_images)
+                # Two-stage diffusion generation (use final_features)
+                diffusion_outputs = self.image_generator(final_features, target_images)
                 generated_images = diffusion_outputs['generated_images']
 
                 diffusion_features = {
@@ -607,13 +652,28 @@ class EnhancedHMAD(nn.Module):
             'advanced_features': advanced_features,  # Phase 1 results
             'multi_branch_features': multi_branch_features if self.use_multi_branch else {},  # Phase 2 results
             'cross_modal_features': cross_modal_features if self.use_cross_modal_alignment else {},  # Phase 3 results
-            'diffusion_features': diffusion_features if self.use_two_stage_diffusion else {}  # Phase 4 results
+            'diffusion_features': diffusion_features if self.use_two_stage_diffusion else {},  # Phase 4 results
+            'domain_features': domain_features if self.use_domain_adaptation else {}  # Phase 5 results
         }
         
-        # Simple loss if target provided
+        # Enhanced loss calculation if target provided
         if target_images is not None:
-            loss = F.mse_loss(generated_images, target_images)
-            outputs['total_loss'] = loss
+            # Base reconstruction loss
+            reconstruction_loss = F.mse_loss(generated_images, target_images)
+
+            # Add TSF loss if available
+            if 'tsf_loss' in diffusion_features and diffusion_features['tsf_loss'] is not None:
+                reconstruction_loss = diffusion_features['tsf_loss']
+
+            # Add domain loss if available
+            total_loss = reconstruction_loss
+            if 'domain_loss' in domain_features and domain_features['domain_loss'] is not None:
+                domain_loss = domain_features['domain_loss']
+                total_loss = reconstruction_loss + self.domain_loss_weight * domain_loss
+                outputs['domain_loss'] = domain_loss
+
+            outputs['reconstruction_loss'] = reconstruction_loss
+            outputs['total_loss'] = total_loss
             
         return outputs
 
@@ -922,10 +982,68 @@ class TwoStageDiffusionGenerator(nn.Module):
 
         return total_loss
 
+class GradientReversalLayer(torch.autograd.Function):
+    """Gradient Reversal Layer untuk adversarial training"""
+
+    @staticmethod
+    def forward(ctx, x):
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return -grad_output
+
+class DomainAdaptationModule(nn.Module):
+    """Domain adaptation untuk multi-dataset training - Phase 5"""
+
+    def __init__(self, feature_dim: int, num_domains: int = 2):
+        super().__init__()
+        self.num_domains = num_domains
+
+        # Domain classifier untuk adversarial training
+        self.domain_classifier = nn.Sequential(
+            nn.Linear(feature_dim, feature_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(feature_dim // 2, num_domains)
+        )
+
+        # Domain-specific normalization layers
+        self.domain_norms = nn.ModuleList([
+            nn.LayerNorm(feature_dim) for _ in range(num_domains)
+        ])
+
+        # Gradient reversal layer
+        self.gradient_reversal = GradientReversalLayer()
+
+    def forward(self, features: torch.Tensor, domain_id: torch.Tensor) -> dict:
+        """
+        Args:
+            features: (batch_size, feature_dim)
+            domain_id: (batch_size,) - 0 for MindBigData, 1 for Crell
+        """
+        batch_size = features.shape[0]
+
+        # Domain-specific normalization
+        normalized_features = torch.zeros_like(features)
+        for i in range(self.num_domains):
+            mask = (domain_id == i)
+            if mask.any():
+                normalized_features[mask] = self.domain_norms[i](features[mask])
+
+        # Domain classification untuk adversarial loss
+        reversed_features = self.gradient_reversal.apply(normalized_features)
+        domain_pred = self.domain_classifier(reversed_features)
+
+        return {
+            'adapted_features': normalized_features,
+            'domain_predictions': domain_pred
+        }
+
 def test_enhanced_hmad():
-    """Test enhanced HMAD framework dengan two-stage diffusion generation"""
+    """Test enhanced HMAD framework dengan domain adaptation"""
     print("="*60)
-    print("TESTING ENHANCED HMAD FRAMEWORK - PHASE 4")
+    print("TESTING ENHANCED HMAD FRAMEWORK - PHASE 5")
     print("="*60)
     
     # Check device
@@ -1018,6 +1136,17 @@ def test_enhanced_hmad():
                         print(f"    Diffusion CLIP latent shape: {diff_feat['diffusion_clip_latent'].shape}")
                     if 'tsf_loss' in diff_feat and diff_feat['tsf_loss'] is not None:
                         print(f"    TSF loss: {diff_feat['tsf_loss'].item():.4f}")
+
+                # Report domain features (Phase 5)
+                if 'domain_features' in outputs and outputs['domain_features']:
+                    dom_feat = outputs['domain_features']
+                    print(f"  Domain features (Phase 5):")
+                    if 'adapted_features' in dom_feat:
+                        print(f"    Domain-adapted features shape: {dom_feat['adapted_features'].shape}")
+                    if 'domain_predictions' in dom_feat:
+                        print(f"    Domain predictions shape: {dom_feat['domain_predictions'].shape}")
+                    if 'domain_loss' in dom_feat and dom_feat['domain_loss'] is not None:
+                        print(f"    Domain loss: {dom_feat['domain_loss'].item():.4f}")
                     
             except Exception as e:
                 print(f"✗ MindBigData forward pass failed: {e}")
@@ -1082,13 +1211,24 @@ def test_enhanced_hmad():
                     if 'tsf_loss' in diff_feat and diff_feat['tsf_loss'] is not None:
                         print(f"    TSF loss: {diff_feat['tsf_loss'].item():.4f}")
 
+                # Report domain features (Phase 5)
+                if 'domain_features' in outputs and outputs['domain_features']:
+                    dom_feat = outputs['domain_features']
+                    print(f"  Domain features (Phase 5):")
+                    if 'adapted_features' in dom_feat:
+                        print(f"    Domain-adapted features shape: {dom_feat['adapted_features'].shape}")
+                    if 'domain_predictions' in dom_feat:
+                        print(f"    Domain predictions shape: {dom_feat['domain_predictions'].shape}")
+                    if 'domain_loss' in dom_feat and dom_feat['domain_loss'] is not None:
+                        print(f"    Domain loss: {dom_feat['domain_loss'].item():.4f}")
+
             except Exception as e:
                 print(f"✗ Crell forward pass failed: {e}")
                 import traceback
                 traceback.print_exc()
     
     print("\n" + "="*60)
-    print("ENHANCED HMAD FRAMEWORK PHASE 4 TEST COMPLETED")
+    print("ENHANCED HMAD FRAMEWORK PHASE 5 TEST COMPLETED")
     print("="*60)
     
     # Test training step
