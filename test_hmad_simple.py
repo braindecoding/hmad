@@ -8,6 +8,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+import math
+from typing import Optional
 from test_hmad import load_mindbigdata_sample, load_crell_sample, load_stimulus_images
 
 # Import additional components for Phase 2
@@ -225,21 +227,96 @@ class ConnectivityBranch(nn.Module):
 
         return connectivity_features
 
+class CrossModalAlignmentModule(nn.Module):
+    """Advanced Cross-modal alignment dengan CLIP space - Phase 3"""
+
+    def __init__(self, eeg_dim: int, clip_dim: int = 512):
+        super().__init__()
+
+        # Progressive alignment layers
+        self.alignment_layers = nn.Sequential(
+            nn.Linear(eeg_dim, eeg_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(eeg_dim // 2, clip_dim),
+            nn.LayerNorm(clip_dim)
+        )
+
+        # Contrastive learning projection head
+        self.projection_head = nn.Sequential(
+            nn.Linear(clip_dim, clip_dim),
+            nn.ReLU(),
+            nn.Linear(clip_dim, clip_dim)
+        )
+
+        # Temperature parameter untuk contrastive learning
+        self.temperature = nn.Parameter(torch.tensor(0.07))
+
+    def forward(self, eeg_features: torch.Tensor) -> dict:
+        """
+        Args:
+            eeg_features: (batch_size, eeg_dim) or (batch_size, seq_len, eeg_dim)
+        Returns:
+            CLIP-aligned features
+        """
+        # Handle both 2D and 3D inputs
+        if len(eeg_features.shape) == 3:
+            # Global average pooling across sequence
+            pooled_features = eeg_features.mean(dim=1)  # (batch_size, eeg_dim)
+        else:
+            pooled_features = eeg_features
+
+        # Alignment to CLIP space
+        aligned_features = self.alignment_layers(pooled_features)
+
+        # Projection untuk contrastive learning
+        projected_features = self.projection_head(aligned_features)
+
+        return {
+            'aligned_features': aligned_features,
+            'projected_features': projected_features
+        }
+
+    def contrastive_loss(self, eeg_features: torch.Tensor, image_features: torch.Tensor) -> torch.Tensor:
+        """Compute contrastive loss untuk alignment"""
+        # Normalize features
+        eeg_norm = F.normalize(eeg_features, dim=-1)
+        image_norm = F.normalize(image_features, dim=-1)
+
+        # Compute similarity matrix
+        similarity = torch.matmul(eeg_norm, image_norm.T) / self.temperature
+
+        # Labels (diagonal elements are positive pairs)
+        batch_size = eeg_features.shape[0]
+        labels = torch.arange(batch_size, device=eeg_features.device)
+
+        # Cross-entropy loss
+        loss_eeg_to_image = F.cross_entropy(similarity, labels)
+        loss_image_to_eeg = F.cross_entropy(similarity.T, labels)
+
+        return (loss_eeg_to_image + loss_image_to_eeg) / 2
+
 class EnhancedHMAD(nn.Module):
-    """Enhanced HMAD dengan multi-branch feature extraction - Phase 2"""
+    """Enhanced HMAD dengan two-stage diffusion generation - Phase 4"""
 
     def __init__(self,
                  mindbigdata_channels: int = 14,
                  crell_channels: int = 64,
                  d_model: int = 256,
                  image_size: int = 64,
+                 clip_dim: int = 512,
                  use_advanced_preprocessing: bool = True,
-                 use_multi_branch: bool = True):
+                 use_multi_branch: bool = True,
+                 use_cross_modal_alignment: bool = True,
+                 use_two_stage_diffusion: bool = True):
         super().__init__()
 
         self.use_advanced_preprocessing = use_advanced_preprocessing
         self.use_multi_branch = use_multi_branch
+        self.use_cross_modal_alignment = use_cross_modal_alignment
+        self.use_two_stage_diffusion = use_two_stage_diffusion
         self.d_model = d_model
+        self.clip_dim = clip_dim
 
         # Advanced preprocessing components (Phase 1)
         if use_advanced_preprocessing:
@@ -285,24 +362,32 @@ class EnhancedHMAD(nn.Module):
             self.fusion_layer = nn.MultiheadAttention(d_model, 8, batch_first=True)
             self.output_projection = nn.Linear(d_model, d_model)
         
-        # Simplified feature extractor
+        # Simplified feature extractor (fallback)
         self.feature_extractor = nn.Sequential(
             nn.TransformerEncoder(
                 nn.TransformerEncoderLayer(d_model, 8, batch_first=True),
                 num_layers=2
             )
         )
-        
-        # Cross-modal alignment (simplified)
-        self.alignment_module = nn.Sequential(
-            nn.Linear(d_model, d_model // 2),
-            nn.ReLU(),
-            nn.Linear(d_model // 2, 512),  # CLIP dimension
-            nn.LayerNorm(512)
-        )
-        
-        # Simple image generator
-        self.image_generator = SimpleImageGenerator(512, image_size)
+
+        # Cross-modal alignment (Phase 3)
+        if use_cross_modal_alignment:
+            self.alignment_module = CrossModalAlignmentModule(d_model, clip_dim)
+        else:
+            # Simplified alignment (fallback)
+            self.alignment_module = nn.Sequential(
+                nn.Linear(d_model, d_model // 2),
+                nn.ReLU(),
+                nn.Linear(d_model // 2, clip_dim),
+                nn.LayerNorm(clip_dim)
+            )
+
+        # Two-stage diffusion generator (Phase 4)
+        if use_two_stage_diffusion:
+            self.image_generator = TwoStageDiffusionGenerator(clip_dim, clip_dim, image_size)  # Use clip_dim for both
+        else:
+            # Enhanced image generator (fallback)
+            self.image_generator = EnhancedImageGenerator(clip_dim, image_size)
         
     def forward(self, eeg_data, dataset_type, target_images=None):
         """Enhanced forward pass dengan multi-branch feature extraction"""
@@ -466,18 +551,63 @@ class EnhancedHMAD(nn.Module):
             extracted_features = self.feature_extractor(features)
             pooled_features = extracted_features.mean(dim=1)
         
-        # Cross-modal alignment
-        aligned_features = self.alignment_module(pooled_features)  # (batch, 512)
-        
-        # Image generation
-        generated_images = self.image_generator(aligned_features)  # (batch, 3, 64, 64)
+        # Cross-modal alignment (Phase 3)
+        cross_modal_features = {}
+
+        if self.use_cross_modal_alignment:
+            try:
+                # Advanced cross-modal alignment
+                alignment_outputs = self.alignment_module(pooled_features)
+                aligned_features = alignment_outputs['aligned_features']  # (batch, clip_dim)
+                projected_features = alignment_outputs['projected_features']  # For contrastive learning
+
+                cross_modal_features = {
+                    'aligned_features': aligned_features,
+                    'projected_features': projected_features
+                }
+
+                print(f"  Cross-modal alignment successful for {dataset_type}")
+
+            except Exception as e:
+                print(f"  Cross-modal alignment failed: {e}, falling back to basic")
+                self.use_cross_modal_alignment = False
+                aligned_features = self.alignment_module(pooled_features)
+        else:
+            # Basic alignment
+            aligned_features = self.alignment_module(pooled_features)
+
+        # Image generation (Phase 4)
+        diffusion_features = {}
+
+        if self.use_two_stage_diffusion:
+            try:
+                # Two-stage diffusion generation (use aligned_features instead of pooled_features)
+                diffusion_outputs = self.image_generator(aligned_features, target_images)
+                generated_images = diffusion_outputs['generated_images']
+
+                diffusion_features = {
+                    'diffusion_clip_latent': diffusion_outputs['clip_latent'],
+                    'tsf_loss': diffusion_outputs.get('tsf_loss', None)
+                }
+
+                print(f"  Two-stage diffusion generation successful for {dataset_type}")
+
+            except Exception as e:
+                print(f"  Two-stage diffusion failed: {e}, falling back to enhanced generator")
+                self.use_two_stage_diffusion = False
+                generated_images = self.image_generator(aligned_features)
+        else:
+            # Enhanced image generation (fallback)
+            generated_images = self.image_generator(aligned_features)
         
         outputs = {
             'generated_images': generated_images,
             'clip_latent': aligned_features,
             'features': pooled_features,
             'advanced_features': advanced_features,  # Phase 1 results
-            'multi_branch_features': multi_branch_features if self.use_multi_branch else {}  # Phase 2 results
+            'multi_branch_features': multi_branch_features if self.use_multi_branch else {},  # Phase 2 results
+            'cross_modal_features': cross_modal_features if self.use_cross_modal_alignment else {},  # Phase 3 results
+            'diffusion_features': diffusion_features if self.use_two_stage_diffusion else {}  # Phase 4 results
         }
         
         # Simple loss if target provided
@@ -487,13 +617,69 @@ class EnhancedHMAD(nn.Module):
             
         return outputs
 
-class SimpleImageGenerator(nn.Module):
-    """Simple image generator dari CLIP features"""
-    
+class EnhancedImageGenerator(nn.Module):
+    """Enhanced image generator dengan better architecture - Phase 3"""
+
     def __init__(self, clip_dim: int, image_size: int = 64):
         super().__init__()
         self.image_size = image_size
-        
+
+        # Enhanced generator dengan residual connections
+        self.initial_projection = nn.Sequential(
+            nn.Linear(clip_dim, 1024),
+            nn.ReLU(),
+            nn.Dropout(0.1)
+        )
+
+        # Residual blocks
+        self.res_blocks = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(1024, 1024),
+                nn.ReLU(),
+                nn.Dropout(0.1),
+                nn.Linear(1024, 1024)
+            ) for _ in range(3)
+        ])
+
+        # Final generation layers
+        self.final_layers = nn.Sequential(
+            nn.Linear(1024, 2048),
+            nn.ReLU(),
+            nn.Linear(2048, 4096),
+            nn.ReLU(),
+            nn.Linear(4096, 3 * image_size * image_size),
+            nn.Tanh()
+        )
+
+    def forward(self, clip_features):
+        """Generate images from CLIP features dengan residual connections"""
+        batch_size = clip_features.shape[0]
+
+        # Initial projection
+        x = self.initial_projection(clip_features)
+
+        # Residual blocks
+        for res_block in self.res_blocks:
+            residual = x
+            x = res_block(x)
+            x = x + residual  # Residual connection
+            x = F.relu(x)
+
+        # Final generation
+        flat_images = self.final_layers(x)
+
+        # Reshape to image format
+        images = flat_images.view(batch_size, 3, self.image_size, self.image_size)
+
+        return images
+
+class SimpleImageGenerator(nn.Module):
+    """Simple image generator dari CLIP features (fallback)"""
+
+    def __init__(self, clip_dim: int, image_size: int = 64):
+        super().__init__()
+        self.image_size = image_size
+
         # Simple upsampling network
         self.generator = nn.Sequential(
             nn.Linear(clip_dim, 1024),
@@ -505,23 +691,241 @@ class SimpleImageGenerator(nn.Module):
             nn.Linear(4096, 3 * image_size * image_size),
             nn.Tanh()
         )
-        
+
     def forward(self, clip_features):
         """Generate images from CLIP features"""
         batch_size = clip_features.shape[0]
-        
+
         # Generate flattened images
         flat_images = self.generator(clip_features)
-        
+
         # Reshape to image format
         images = flat_images.view(batch_size, 3, self.image_size, self.image_size)
-        
+
         return images
 
+class SinusoidalPositionEmbedding(nn.Module):
+    """Sinusoidal position embedding untuk timestep encoding"""
+
+    def __init__(self, dim: int):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, timesteps: torch.Tensor) -> torch.Tensor:
+        half_dim = self.dim // 2
+        embeddings = math.log(10000) / (half_dim - 1)
+        embeddings = torch.exp(torch.arange(half_dim, device=timesteps.device) * -embeddings)
+        embeddings = timesteps[:, None] * embeddings[None, :]
+        embeddings = torch.cat([torch.sin(embeddings), torch.cos(embeddings)], dim=-1)
+        return embeddings
+
+class ConditionalResBlock(nn.Module):
+    """Residual block dengan conditional input untuk diffusion"""
+
+    def __init__(self, in_channels: int, out_channels: int, condition_dim: int):
+        super().__init__()
+
+        self.conv1 = nn.Conv2d(in_channels, out_channels, 3, padding=1)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, 3, padding=1)
+
+        # Conditional modulation
+        self.condition_proj = nn.Linear(condition_dim, out_channels * 2)
+
+        # Normalization
+        self.norm1 = nn.GroupNorm(min(8, out_channels), out_channels)
+        self.norm2 = nn.GroupNorm(min(8, out_channels), out_channels)
+
+        # Skip connection
+        if in_channels != out_channels:
+            self.skip_conv = nn.Conv2d(in_channels, out_channels, 1)
+        else:
+            self.skip_conv = nn.Identity()
+
+    def forward(self, x: torch.Tensor, condition: torch.Tensor) -> torch.Tensor:
+        skip = self.skip_conv(x)
+
+        # First conv
+        h = self.conv1(x)
+        h = self.norm1(h)
+
+        # Conditional modulation
+        condition_params = self.condition_proj(condition)
+        scale, shift = condition_params.chunk(2, dim=1)
+        scale = scale.unsqueeze(-1).unsqueeze(-1)
+        shift = shift.unsqueeze(-1).unsqueeze(-1)
+
+        h = h * (1 + scale) + shift
+        h = F.relu(h)
+
+        # Second conv
+        h = self.conv2(h)
+        h = self.norm2(h)
+
+        # Residual connection
+        return F.relu(h + skip)
+
+class LatentDiffusionDecoder(nn.Module):
+    """Simplified Latent diffusion decoder untuk generating images from CLIP features"""
+
+    def __init__(self, clip_dim: int, image_size: int = 64):
+        super().__init__()
+        self.image_size = image_size
+
+        # Conditional embedding
+        self.condition_embedding = nn.Sequential(
+            nn.Linear(clip_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, 512)
+        )
+
+        # Simplified U-Net architecture
+        self.time_embedding = SinusoidalPositionEmbedding(512)  # Match condition dimension
+
+        # Encoder blocks (simplified)
+        self.encoder_blocks = nn.ModuleList([
+            ConditionalResBlock(3, 32, 512),
+            ConditionalResBlock(32, 64, 512),
+            ConditionalResBlock(64, 128, 512)
+        ])
+
+        # Bottleneck
+        self.bottleneck = ConditionalResBlock(128, 128, 512)
+
+        # Decoder blocks dengan skip connections
+        self.decoder_blocks = nn.ModuleList([
+            ConditionalResBlock(256, 64, 512),   # 128 + 128 (skip)
+            ConditionalResBlock(128, 32, 512),   # 64 + 64 (skip)
+            ConditionalResBlock(64, 16, 512)     # 32 + 32 (skip)
+        ])
+
+        # Final output layer
+        self.final_conv = nn.Conv2d(16, 3, kernel_size=3, padding=1)
+
+    def forward(self, clip_features: torch.Tensor, timestep: float = 0.0) -> torch.Tensor:
+        batch_size = clip_features.shape[0]
+
+        # Condition embedding
+        condition = self.condition_embedding(clip_features)
+
+        # Time embedding
+        t_emb = self.time_embedding(torch.tensor([timestep] * batch_size,
+                                                device=clip_features.device))
+
+        # Combine condition dan time
+        combined_condition = condition + t_emb
+
+        # Start dengan noise atau learned initialization
+        x = torch.randn(batch_size, 3, self.image_size, self.image_size,
+                       device=clip_features.device)
+
+        # Encoder dengan skip connections
+        skip_connections = []
+        for encoder_block in self.encoder_blocks:
+            x = encoder_block(x, combined_condition)
+            skip_connections.append(x)
+            x = F.max_pool2d(x, 2)
+
+        # Bottleneck
+        x = self.bottleneck(x, combined_condition)
+
+        # Decoder dengan skip connections
+        for i, decoder_block in enumerate(self.decoder_blocks):
+            x = F.interpolate(x, scale_factor=2, mode='bilinear', align_corners=False)
+
+            # Skip connection
+            if i < len(skip_connections):
+                skip = skip_connections[-(i+1)]
+                # Resize skip jika perlu
+                if x.shape[2:] != skip.shape[2:]:
+                    skip = F.interpolate(skip, size=x.shape[2:], mode='bilinear', align_corners=False)
+                x = torch.cat([x, skip], dim=1)
+
+            x = decoder_block(x, combined_condition)
+
+        # Final output
+        x = self.final_conv(x)
+        x = torch.tanh(x)  # Output range [-1, 1]
+
+        return x
+
+class TwoStageDiffusionGenerator(nn.Module):
+    """Two-stage diffusion: EEG->CLIP latent, CLIP latent->Image - Phase 4"""
+
+    def __init__(self, eeg_dim: int, clip_dim: int = 512, image_size: int = 64):
+        super().__init__()
+
+        # Stage 1: EEG to CLIP latent mapping (enhanced)
+        self.eeg_to_clip = nn.Sequential(
+            nn.Linear(eeg_dim, eeg_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(eeg_dim // 2, clip_dim),
+            nn.LayerNorm(clip_dim),
+            nn.Tanh()  # Bounded output
+        )
+
+        # Stage 2: CLIP latent to image diffusion
+        self.latent_to_image = LatentDiffusionDecoder(clip_dim, image_size)
+
+        # Temporal-Spatial-Frequency loss components
+        self.temporal_loss_weight = nn.Parameter(torch.tensor(1.0))
+        self.spatial_loss_weight = nn.Parameter(torch.tensor(1.0))
+        self.frequency_loss_weight = nn.Parameter(torch.tensor(1.0))
+
+    def forward(self, eeg_features: torch.Tensor,
+                target_images: Optional[torch.Tensor] = None,
+                noise_level: float = 0.0) -> dict:
+        # Stage 1: EEG to CLIP latent
+        clip_latent = self.eeg_to_clip(eeg_features)
+
+        # Stage 2: CLIP latent to image
+        generated_images = self.latent_to_image(clip_latent, noise_level)
+
+        outputs = {
+            'clip_latent': clip_latent,
+            'generated_images': generated_images
+        }
+
+        # Compute TSF loss if target provided
+        if target_images is not None:
+            tsf_loss = self.compute_tsf_loss(generated_images, target_images)
+            outputs['tsf_loss'] = tsf_loss
+            outputs['total_loss'] = tsf_loss
+
+        return outputs
+
+    def compute_tsf_loss(self, generated: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """Temporal-Spatial-Frequency loss function"""
+
+        # Temporal loss (MSE in time domain)
+        temporal_loss = F.mse_loss(generated, target)
+
+        # Spatial loss (MSE in spatial domain)
+        spatial_loss = F.mse_loss(
+            generated.view(generated.shape[0], -1),
+            target.view(target.shape[0], -1)
+        )
+
+        # Frequency loss (MSE in frequency domain using FFT)
+        generated_fft = torch.fft.fft2(generated)
+        target_fft = torch.fft.fft2(target)
+
+        frequency_loss = F.mse_loss(
+            torch.abs(generated_fft),
+            torch.abs(target_fft)
+        )
+
+        # Weighted combination
+        total_loss = (self.temporal_loss_weight * temporal_loss +
+                     self.spatial_loss_weight * spatial_loss +
+                     self.frequency_loss_weight * frequency_loss)
+
+        return total_loss
+
 def test_enhanced_hmad():
-    """Test enhanced HMAD framework dengan advanced preprocessing"""
+    """Test enhanced HMAD framework dengan two-stage diffusion generation"""
     print("="*60)
-    print("TESTING ENHANCED HMAD FRAMEWORK - PHASE 1")
+    print("TESTING ENHANCED HMAD FRAMEWORK - PHASE 4")
     print("="*60)
     
     # Check device
@@ -596,6 +1000,24 @@ def test_enhanced_hmad():
                         print(f"    Spectral branch shape: {mb_feat['spectral'].shape}")
                     if 'connectivity' in mb_feat:
                         print(f"    Connectivity branch shape: {mb_feat['connectivity'].shape}")
+
+                # Report cross-modal features (Phase 3)
+                if 'cross_modal_features' in outputs and outputs['cross_modal_features']:
+                    cm_feat = outputs['cross_modal_features']
+                    print(f"  Cross-modal features (Phase 3):")
+                    if 'aligned_features' in cm_feat:
+                        print(f"    CLIP-aligned features shape: {cm_feat['aligned_features'].shape}")
+                    if 'projected_features' in cm_feat:
+                        print(f"    Contrastive projection shape: {cm_feat['projected_features'].shape}")
+
+                # Report diffusion features (Phase 4)
+                if 'diffusion_features' in outputs and outputs['diffusion_features']:
+                    diff_feat = outputs['diffusion_features']
+                    print(f"  Diffusion features (Phase 4):")
+                    if 'diffusion_clip_latent' in diff_feat:
+                        print(f"    Diffusion CLIP latent shape: {diff_feat['diffusion_clip_latent'].shape}")
+                    if 'tsf_loss' in diff_feat and diff_feat['tsf_loss'] is not None:
+                        print(f"    TSF loss: {diff_feat['tsf_loss'].item():.4f}")
                     
             except Exception as e:
                 print(f"✗ MindBigData forward pass failed: {e}")
@@ -641,14 +1063,32 @@ def test_enhanced_hmad():
                         print(f"    Spectral branch shape: {mb_feat['spectral'].shape}")
                     if 'connectivity' in mb_feat:
                         print(f"    Connectivity branch shape: {mb_feat['connectivity'].shape}")
-                    
+
+                # Report cross-modal features (Phase 3)
+                if 'cross_modal_features' in outputs and outputs['cross_modal_features']:
+                    cm_feat = outputs['cross_modal_features']
+                    print(f"  Cross-modal features (Phase 3):")
+                    if 'aligned_features' in cm_feat:
+                        print(f"    CLIP-aligned features shape: {cm_feat['aligned_features'].shape}")
+                    if 'projected_features' in cm_feat:
+                        print(f"    Contrastive projection shape: {cm_feat['projected_features'].shape}")
+
+                # Report diffusion features (Phase 4)
+                if 'diffusion_features' in outputs and outputs['diffusion_features']:
+                    diff_feat = outputs['diffusion_features']
+                    print(f"  Diffusion features (Phase 4):")
+                    if 'diffusion_clip_latent' in diff_feat:
+                        print(f"    Diffusion CLIP latent shape: {diff_feat['diffusion_clip_latent'].shape}")
+                    if 'tsf_loss' in diff_feat and diff_feat['tsf_loss'] is not None:
+                        print(f"    TSF loss: {diff_feat['tsf_loss'].item():.4f}")
+
             except Exception as e:
                 print(f"✗ Crell forward pass failed: {e}")
                 import traceback
                 traceback.print_exc()
     
     print("\n" + "="*60)
-    print("ENHANCED HMAD FRAMEWORK PHASE 2 TEST COMPLETED")
+    print("ENHANCED HMAD FRAMEWORK PHASE 4 TEST COMPLETED")
     print("="*60)
     
     # Test training step
