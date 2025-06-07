@@ -24,11 +24,12 @@ from typing import Tuple, Dict, List, Optional
 from torch.utils.data import DataLoader
 
 class HilbertHuangTransform(nn.Module):
-    """Advanced HHT preprocessing untuk extracting intrinsic mode functions"""
-    
+    """Simplified HHT preprocessing untuk extracting intrinsic mode functions"""
+
     def __init__(self, num_imfs: int = 8):
         super().__init__()
         self.num_imfs = num_imfs
+        self.use_simple_decomposition = True  # Use simple filtering instead of EMD
         
     def empirical_mode_decomposition(self, signal: torch.Tensor) -> torch.Tensor:
         """EMD dengan stopping criteria optimized untuk EEG"""

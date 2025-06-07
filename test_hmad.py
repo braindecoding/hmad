@@ -17,30 +17,41 @@ import os
 from hmad import HMADFramework, create_hmad_model, HMADTrainer
 
 def load_mindbigdata_sample(filepath: str, max_samples: int = 10):
-    """Load sample data dari MindBigData untuk testing"""
-    print(f"Loading MindBigData from {filepath}...")
-    
+    """Load sample data dari MindBigData EPOC untuk testing"""
+    print(f"Loading MindBigData EPOC from {filepath}...")
+
+    # EPOC channels dalam urutan yang benar
+    epoc_channels = ["AF3", "F7", "F3", "FC5", "T7", "P7", "O1", "O2", "P8", "T8", "FC6", "F4", "F8", "AF4"]
     signals_by_event = defaultdict(lambda: defaultdict(list))
-    
+
     try:
         with open(filepath, 'r') as f:
             for line_num, line in enumerate(f):
-                if line_num > max_samples * 100:  # Limit untuk testing
+                if line_num > max_samples * 200:  # Limit untuk testing (lebih besar karena butuh semua channels)
                     break
-                    
+
                 parts = line.strip().split('\t')
                 if len(parts) >= 7:
-                    event_id = int(parts[1])
-                    channel = parts[3]
-                    digit_code = int(parts[4])
-                    data_str = parts[6]
-                    
-                    if digit_code >= 0 and digit_code <= 9:  # Valid digits only
-                        data_values = [float(x) for x in data_str.split(',')]
-                        signals_by_event[event_id][channel].append({
-                            'code': digit_code,
-                            'data': np.array(data_values)
-                        })
+                    device = parts[2]
+
+                    # Hanya ambil data dari EPOC device
+                    if device == "EP":
+                        event_id = int(parts[1])
+                        channel = parts[3]
+                        digit_code = int(parts[4])
+                        data_str = parts[6]
+
+                        # Hanya ambil digit yang valid (0-9)
+                        if digit_code >= 0 and digit_code <= 9 and channel in epoc_channels:
+                            try:
+                                data_values = [float(x) for x in data_str.split(',')]
+                                signals_by_event[event_id][channel] = {
+                                    'code': digit_code,
+                                    'data': np.array(data_values)
+                                }
+                            except ValueError:
+                                continue  # Skip malformed data
+
     except Exception as e:
         print(f"Error loading MindBigData: {e}")
         return None, None
@@ -48,38 +59,42 @@ def load_mindbigdata_sample(filepath: str, max_samples: int = 10):
     # Convert to tensor format
     eeg_data = []
     labels = []
-    
+
+    print(f"Found {len(signals_by_event)} events")
+
     for event_id, channels_data in signals_by_event.items():
-        if len(channels_data) >= 14:  # Ensure we have all channels
-            # Get first sample from each channel
+        # Pastikan kita punya semua 14 channels EPOC
+        if len(channels_data) == 14:
             channel_signals = []
             digit_code = None
-            
-            for channel in ['AF3', 'F7', 'F3', 'FC5', 'T7', 'P7', 'O1', 
-                           'O2', 'P8', 'T8', 'FC6', 'F4', 'F8', 'AF4']:
-                if channel in channels_data and len(channels_data[channel]) > 0:
-                    sample = channels_data[channel][0]
+
+            # Ambil data dalam urutan channel yang benar
+            for channel in epoc_channels:
+                if channel in channels_data:
+                    sample = channels_data[channel]
                     channel_signals.append(sample['data'])
                     if digit_code is None:
                         digit_code = sample['code']
-            
+                else:
+                    break  # Skip event jika ada channel yang missing
+
             if len(channel_signals) == 14 and digit_code is not None:
-                # Pad or truncate to fixed length (256 time points)
+                # Pad atau truncate ke fixed length (256 time points untuk ~2 detik pada 128Hz)
                 fixed_length = 256
                 processed_signals = []
-                
+
                 for signal in channel_signals:
                     if len(signal) >= fixed_length:
                         processed_signals.append(signal[:fixed_length])
                     else:
-                        # Pad with zeros
-                        padded = np.zeros(fixed_length)
+                        # Pad dengan mean value untuk menghindari artifacts
+                        padded = np.full(fixed_length, np.mean(signal))
                         padded[:len(signal)] = signal
                         processed_signals.append(padded)
-                
+
                 eeg_data.append(np.array(processed_signals))
                 labels.append(digit_code)
-                
+
                 if len(eeg_data) >= max_samples:
                     break
     
@@ -93,52 +108,139 @@ def load_mindbigdata_sample(filepath: str, max_samples: int = 10):
         return None, None
 
 def load_crell_sample(filepath: str, max_samples: int = 10):
-    """Load sample data dari Crell untuk testing"""
+    """Load sample data dari Crell untuk testing dengan proper marker parsing"""
     print(f"Loading Crell data from {filepath}...")
-    
+
+    # Letter mapping: ascii index to letter
+    letter_mapping = {100: 'a', 103: 'd', 104: 'e', 105: 'f', 109: 'j',
+                     113: 'n', 114: 'o', 118: 's', 119: 't', 121: 'v'}
+
     try:
         data = scipy.io.loadmat(filepath)
-        
-        # Extract paradigm data (simplified)
-        if 'paradigm_one' in data:
-            paradigm_data = data['paradigm_one']
-            
-            # Extract EEG data (assuming structure exists)
-            if len(paradigm_data) > 0 and len(paradigm_data[0]) > 0:
-                round_data = paradigm_data[0, 0]
-                
-                if 'BrainVisionRDA_data' in round_data.dtype.names:
-                    eeg_data = round_data['BrainVisionRDA_data'][0, 0]
-                    
-                    # Create sample data (simplified)
-                    # In real implementation, would parse markers and extract epochs
-                    num_channels, total_timepoints = eeg_data.shape
-                    
-                    # Create fixed-size samples
-                    sample_length = 500  # 1 second at 500Hz
-                    samples = []
-                    labels = []
-                    
-                    for i in range(0, min(total_timepoints - sample_length, max_samples * sample_length), sample_length):
-                        sample = eeg_data[:, i:i+sample_length]
-                        samples.append(sample)
-                        labels.append(0)  # Dummy label for now
-                        
-                        if len(samples) >= max_samples:
-                            break
-                    
-                    if len(samples) > 0:
-                        eeg_tensor = torch.tensor(np.array(samples), dtype=torch.float32)
-                        labels_tensor = torch.tensor(labels, dtype=torch.long)
-                        print(f"Loaded {len(samples)} Crell samples, shape: {eeg_tensor.shape}")
-                        return eeg_tensor, labels_tensor
-        
-        print("Could not extract valid Crell data")
-        return None, None
-        
+
+        eeg_samples = []
+        labels = []
+
+        # Process both paradigm rounds
+        for paradigm_key in ['round01_paradigm', 'round02_paradigm']:
+            if paradigm_key not in data:
+                continue
+
+            paradigm_data = data[paradigm_key]
+            if len(paradigm_data) == 0:
+                continue
+
+            round_data = paradigm_data[0, 0]
+
+            # Extract data arrays
+            if 'BrainVisionRDA_data' not in round_data.dtype.names:
+                continue
+
+            # Correct way to access the data based on debug output
+            eeg_data = round_data['BrainVisionRDA_data'].T  # (timepoints, 64) -> (64, timepoints)
+            eeg_times = round_data['BrainVisionRDA_time'].flatten()
+            marker_data = round_data['ParadigmMarker_data'].flatten()
+            marker_times = round_data['ParadigmMarker_time'].flatten()
+
+            print(f"  {paradigm_key}: EEG shape {eeg_data.shape}, {len(marker_data)} markers")
+
+            # Parse markers untuk extract visual epochs
+            visual_epochs = extract_visual_epochs_crell(
+                eeg_data, eeg_times, marker_data, marker_times, letter_mapping
+            )
+
+            for epoch_data, letter_code in visual_epochs:
+                eeg_samples.append(epoch_data)
+                labels.append(letter_code)
+
+                if len(eeg_samples) >= max_samples:
+                    break
+
+            if len(eeg_samples) >= max_samples:
+                break
+
+        if len(eeg_samples) > 0:
+            eeg_tensor = torch.tensor(np.array(eeg_samples), dtype=torch.float32)
+            labels_tensor = torch.tensor(labels, dtype=torch.long)
+            print(f"Loaded {len(eeg_samples)} Crell visual epochs, shape: {eeg_tensor.shape}")
+            return eeg_tensor, labels_tensor
+        else:
+            print("No valid Crell visual epochs found")
+            return None, None
+
     except Exception as e:
         print(f"Error loading Crell data: {e}")
         return None, None
+
+def extract_visual_epochs_crell(eeg_data, eeg_times, marker_data, marker_times, letter_mapping):
+    """Extract visual epochs dari Crell data berdasarkan markers"""
+    epochs = []
+
+    # Find letter presentation events
+    letter_events = []
+    current_letter = None
+    fade_in_time = None
+    fade_out_time = None
+
+    for i, (marker, marker_time) in enumerate(zip(marker_data, marker_times)):
+        if marker >= 100:  # Letter code
+            current_letter = letter_mapping.get(marker, None)
+        elif marker == 1:  # Fade in start
+            fade_in_time = marker_time
+        elif marker == 3:  # Fade out start (end of pure visual phase)
+            fade_out_time = marker_time
+
+            # Extract visual epoch (from fade in to fade out)
+            if current_letter is not None and fade_in_time is not None:
+                letter_events.append({
+                    'letter': current_letter,
+                    'start_time': fade_in_time,
+                    'end_time': fade_out_time
+                })
+
+            # Reset for next letter
+            current_letter = None
+            fade_in_time = None
+            fade_out_time = None
+
+    print(f"    Found {len(letter_events)} letter events")
+
+    # Extract EEG epochs
+    for event in letter_events[:10]:  # Limit untuk testing
+        start_time = event['start_time']
+        end_time = event['end_time']
+
+        # Find corresponding EEG indices
+        start_idx = np.searchsorted(eeg_times, start_time)
+        end_idx = np.searchsorted(eeg_times, end_time)
+
+        if end_idx > start_idx and (end_idx - start_idx) > 100:  # Minimum epoch length
+            # Extract epoch dan resample ke fixed length
+            epoch_data = eeg_data[:, start_idx:end_idx]
+
+            # Resample to fixed length (750 samples = 1.5s at 500Hz)
+            target_length = 750
+            if epoch_data.shape[1] != target_length:
+                # Simple resampling by interpolation
+                from scipy.interpolate import interp1d
+                old_indices = np.linspace(0, epoch_data.shape[1]-1, epoch_data.shape[1])
+                new_indices = np.linspace(0, epoch_data.shape[1]-1, target_length)
+
+                resampled_epoch = np.zeros((64, target_length))
+                for ch in range(64):
+                    f = interp1d(old_indices, epoch_data[ch, :], kind='linear')
+                    resampled_epoch[ch, :] = f(new_indices)
+
+                epoch_data = resampled_epoch
+
+            # Convert letter to numeric label
+            letter_to_num = {'a': 0, 'd': 1, 'e': 2, 'f': 3, 'j': 4,
+                           'n': 5, 'o': 6, 's': 7, 't': 8, 'v': 9}
+            letter_label = letter_to_num.get(event['letter'], 0)
+
+            epochs.append((epoch_data, letter_label))
+
+    return epochs
 
 def load_stimulus_images(stimuli_dir: str, image_size: int = 64):
     """Load stimulus images untuk testing"""
