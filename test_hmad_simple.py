@@ -155,11 +155,17 @@ class SpectralBranch(nn.Module):
         # Frequency band filters (simplified)
         self.freq_bands = ['delta', 'theta', 'alpha', 'beta', 'gamma']
 
+        # Ensure d_model is divisible by 5
+        band_dim = d_model // 5
+        remaining_dim = d_model - (band_dim * 4)  # Last band gets remaining dimensions
+
         # Learnable frequency filters
-        self.band_filters = nn.ModuleDict({
-            band: nn.Conv1d(input_channels, d_model // 5, kernel_size=32, padding=16)
-            for band in self.freq_bands
-        })
+        self.band_filters = nn.ModuleDict()
+        for i, band in enumerate(self.freq_bands):
+            if i == len(self.freq_bands) - 1:  # Last band
+                self.band_filters[band] = nn.Conv1d(input_channels, remaining_dim, kernel_size=32, padding=16)
+            else:
+                self.band_filters[band] = nn.Conv1d(input_channels, band_dim, kernel_size=32, padding=16)
 
         # Spectral attention
         self.spectral_attention = nn.MultiheadAttention(d_model, 8, batch_first=True)
@@ -179,6 +185,10 @@ class SpectralBranch(nn.Module):
 
         # Concatenate band features
         spectral_features = torch.cat(band_features, dim=1)
+
+        # Debug: Check if we have correct dimension
+        expected_channels = sum(conv.out_channels for conv in self.band_filters.values())
+        print(f"    Spectral features shape before transpose: {spectral_features.shape}, expected channels: {expected_channels}")
 
         # Transpose for attention
         spectral_features = spectral_features.transpose(1, 2)
@@ -331,15 +341,22 @@ class EnhancedHMAD(nn.Module):
             try:
                 if dataset_type == 'mindbigdata':
                     # Multi-branch extraction untuk MindBigData
+                    print(f"    Input EEG shape: {eeg_data.shape}")
                     temporal_feat = self.mindbig_temporal_branch(eeg_data)
+                    print(f"    Temporal feat shape: {temporal_feat.shape}")
                     spatial_feat = self.mindbig_spatial_branch(eeg_data)
+                    print(f"    Spatial feat shape: {spatial_feat.shape}")
                     spectral_feat = self.mindbig_spectral_branch(eeg_data)
+                    print(f"    Spectral feat shape: {spectral_feat.shape}")
 
                     if graph_features is not None:
+                        print(f"    Graph features shape: {graph_features.shape}")
                         connectivity_feat = self.mindbig_connectivity_branch(graph_features)
+                        print(f"    Connectivity feat shape: {connectivity_feat.shape}")
                     else:
                         # Fallback jika graph features tidak ada
                         connectivity_feat = torch.zeros_like(temporal_feat)
+                        print(f"    Connectivity feat shape (fallback): {connectivity_feat.shape}")
 
                 else:  # crell
                     # Multi-branch extraction untuk Crell
