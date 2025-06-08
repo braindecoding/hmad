@@ -14,7 +14,8 @@ from PIL import Image
 import os
 
 # Import HMAD framework
-from hmad import HMADFramework, create_hmad_model, HMADTrainer
+from models.hmad import HMADFramework
+from models.hmadv2 import create_improved_hmad_model
 
 def load_mindbigdata_sample(filepath: str, max_samples: int = 10):
     """Load sample data dari MindBigData EPOC untuk testing"""
@@ -305,7 +306,7 @@ def test_hmad_framework():
     
     # Create model
     print("\nCreating HMAD model...")
-    model = create_hmad_model(config)
+    model = create_improved_hmad_model(config)
     model = model.to(device)
     
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")

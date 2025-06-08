@@ -1,0 +1,32 @@
+# Experiment Configuration
+# Reproducible experiment settings
+
+experiment_name: "hmadv2_full_training"
+description: "Full training with proper train/test splits"
+
+random_seeds:
+  global: 42
+  torch: 42
+  numpy: 42
+
+datasets:
+  mindbigdata:
+    max_samples: 200
+    channels: 14
+    sampling_rate: 128
+  
+  crell:
+    max_samples: 50
+    channels: 64
+    sampling_rate: 500
+
+training:
+  optimizer: "Adam"
+  scheduler: "ReduceLROnPlateau"
+  early_stopping: true
+  checkpointing: true
+  
+evaluation:
+  metrics: ["PSNR", "Cosine", "SSIM"]
+  visualization: true
+  save_reconstructions: true
